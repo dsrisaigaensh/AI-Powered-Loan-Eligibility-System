@@ -148,6 +148,16 @@ async def synthesize_speech_deepgram(text: str) -> Optional[bytes]:
 async def voice_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
     
+    # Check if API keys are available
+    if not GROQ_API_KEY or not DEEPGRAM_API_KEY or not deepgram_client_async or not groq_client:
+        logger.warning("Voice agent accessed but API keys are missing")
+        await websocket.send_json({
+            "type": "error",
+            "message": "Voice agent is currently unavailable. API keys not configured. Please use the chat or form instead."
+        })
+        await websocket.close()
+        return
+    
     session_id = str(uuid.uuid4())
     logger.info(f"Voice session started: {session_id}")
     

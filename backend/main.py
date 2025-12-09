@@ -60,26 +60,41 @@ async def lifespan(app: FastAPI):
         db = SessionLocal()
         try:
             if not db.query(User).first():
-                # Create Admin
+                # Create Admin (email verified)
                 admin = User(
                     email="admin@example.com",
                     password_hash=hash_password("admin123"),
                     full_name="Admin User",
-                    role="manager"
+                    role="manager",
+                    email_verified=True
                 )
                 db.add(admin)
                 
-                # Create Applicant
+                # Create Applicant (email verified)
                 applicant = User(
                     email="user@example.com",
                     password_hash=hash_password("user123"),
                     full_name="Test Applicant",
-                    role="applicant"
+                    role="applicant",
+                    email_verified=True
                 )
                 db.add(applicant)
                 
+                # Create Test User (email verified, no OTP needed)
+                test_user = User(
+                    email="test@test.com",
+                    password_hash=hash_password("test123"),
+                    full_name="Test User",
+                    role="applicant",
+                    email_verified=True
+                )
+                db.add(test_user)
+                
                 db.commit()
-                print("Created default users: admin@example.com / admin123, user@example.com / user123")
+                print("Created default users:")
+                print("  - admin@example.com / admin123 (Manager)")
+                print("  - user@example.com / user123 (Applicant)")
+                print("  - test@test.com / test123 (Applicant - No OTP Required)")
         except Exception as e:
             print(f"Error creating default users: {e}")
         finally:
