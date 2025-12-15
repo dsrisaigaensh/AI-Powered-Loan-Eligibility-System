@@ -11,20 +11,59 @@
  * - Displays loan eligibility results
  *
  * Tech Stack:
- * - MediaRecorder API for audio capture (sending PCM16LE)
+ * - AudioContext + GainNode -> MediaRecorder (WebM/Opus)
+ * - **5x Digital Gain Boost**
+ * - Standard WebM Container (Robust)
  * - WebSocket for bi-directional streaming
  * - Web Audio API for playing TTS audio chunks
  * - React hooks for state management
  *
  * @author AI Development Assistant
- * @date November 2025
+ * @date December 2025
  */
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { Phone, PhoneOff, X } from "lucide-react";
-import FileUpload from "./FileUpload";
+import DocumentKYCGrid from "./DocumentKYCGrid";
 import LoanResultCard from "./LoanResultCard";
 import { toast } from "react-toastify";
+import { auth } from "../utils/auth";
+
+// Helper Component for Smooth Typing Effect
+const Typewriter = ({ text }) => {
+  const [displayedText, setDisplayedText] = useState("");
+
+  useEffect(() => {
+    // If text was reset (empty), reset display immediately
+    if (!text) {
+      setDisplayedText("");
+      return;
+    }
+
+    // If we're already fully displayed, check if text grew (streaming)
+    // If text shrunk (shouldn't happen usually unless reset), reset.
+    if (displayedText.length > text.length) {
+      setDisplayedText(text); // snap to new text if it's completely different
+      return;
+    }
+
+    // Interval to "type" catch up
+    const intervalId = setInterval(() => {
+      setDisplayedText((prev) => {
+        if (prev.length < text.length) {
+          return text.slice(0, prev.length + 1); // Reveal one more char
+        }
+        clearInterval(intervalId);
+        return prev;
+      });
+    }, 15); // 15ms per char = ~66 chars/sec (Smooth & Fast)
+
+    return () => clearInterval(intervalId);
+  }, [text, displayedText]); // Re-run when target text changes
+
+  return <p className="whitespace-pre-wrap text-sm">{displayedText}</p>;
+};
 
 const VoiceAgentRealtime = () => {
   // Connection state
@@ -32,8 +71,6 @@ const VoiceAgentRealtime = () => {
   const [isRecording, setIsRecording] = useState(false);
   // eslint-disable-next-line no-unused-vars
   const [isMuted, setIsMuted] = useState(false);
-  // eslint-disable-next-line no-unused-vars
-  const [error, setError] = useState(null);
 
   // Conversation state
   const [partialTranscript, setPartialTranscript] = useState("");
@@ -44,35 +81,31 @@ const VoiceAgentRealtime = () => {
   const [extractedData, setExtractedData] = useState({});
   const [eligibilityResult, setEligibilityResult] = useState(null);
   const [showDocumentUpload, setShowDocumentUpload] = useState(false);
-  // eslint-disable-next-line no-unused-vars
-  const [applicationId, setApplicationId] = useState(null);
   const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [readyForVerification, setReadyForVerification] = useState(null); // New state for manual redirect
 
   // Volume state for visualizer
   const [volume, setVolume] = useState(0);
-
-  // Event Log for debugging
-  // eslint-disable-next-line no-unused-vars
-  const [eventLog, setEventLog] = useState([]);
-  const addLog = (msg) =>
-    setEventLog((prev) =>
-      [
-        `${new Date().toLocaleTimeString().split(" ")[0]} ${msg}`,
-        ...prev,
-      ].slice(0, 3)
-    );
 
   // Refs for persistent connections
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
+  const streamRef = useRef(null);
   const audioQueueRef = useRef([]);
   const isPlayingRef = useRef(false);
   const isRecordingRef = useRef(false); // Ref for event handlers
   const currentSourceRef = useRef(null); // Track current audio source
   const currentAiTokenRef = useRef("");
   const messagesEndRef = useRef(null);
-  const modalScrollRef = useRef(null);
+  const extractedDataRef = useRef({}); // Ref to access latest data in callbacks
+
+  const navigate = useNavigate();
+
+  // Sync ref with state
+  useEffect(() => {
+    extractedDataRef.current = extractedData;
+  }, [extractedData]);
 
   /**
    * Play next audio chunk from queue
@@ -90,6 +123,7 @@ const VoiceAgentRealtime = () => {
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext ||
           window.webkitAudioContext)();
+        await audioContextRef.current.resume();
       }
 
       const audioContext = audioContextRef.current;
@@ -105,7 +139,6 @@ const VoiceAgentRealtime = () => {
       source.connect(audioContext.destination);
 
       source.onended = () => {
-        // Use setTimeout to avoid recursion issues
         setTimeout(() => playNextAudioChunk(), 0);
       };
 
@@ -134,11 +167,9 @@ const VoiceAgentRealtime = () => {
    * Stop current audio playback and clear queue
    */
   const stopAudioPlayback = useCallback(() => {
-    // Clear queue
     audioQueueRef.current = [];
     isPlayingRef.current = false;
 
-    // Stop currently playing audio
     if (currentSourceRef.current) {
       try {
         currentSourceRef.current.stop();
@@ -153,10 +184,10 @@ const VoiceAgentRealtime = () => {
    * Auto-scroll to bottom of conversation
    */
   useEffect(() => {
-    if (finalTranscripts.length > 0 || partialTranscript || currentAiToken) {
+    if (finalTranscripts.length > 0 || currentAiToken) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [finalTranscripts, currentAiToken, partialTranscript]);
+  }, [finalTranscripts, currentAiToken]);
 
   /**
    * Handle incoming WebSocket messages
@@ -167,18 +198,18 @@ const VoiceAgentRealtime = () => {
 
       switch (type) {
         case "partial_transcript":
-          // User started speaking -> Stop AI audio immediately
           stopAudioPlayback();
-
-          // If AI was speaking, finalize its message now (user interrupted or AI finished)
           if (currentAiTokenRef.current) {
-            setFinalTranscripts((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                text: currentAiTokenRef.current.split("|||JSON|||")[0],
-              },
-            ]);
+            const cleanText = currentAiTokenRef.current.split("|||")[0];
+            if (cleanText.trim()) {
+              setFinalTranscripts((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  text: cleanText,
+                },
+              ]);
+            }
             currentAiTokenRef.current = "";
             setCurrentAiToken("");
           }
@@ -186,18 +217,18 @@ const VoiceAgentRealtime = () => {
           break;
 
         case "final_transcript":
-          // User finished speaking -> Stop AI audio immediately (just in case)
           stopAudioPlayback();
-
-          // If AI was speaking, finalize its message now
           if (currentAiTokenRef.current) {
-            setFinalTranscripts((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                text: currentAiTokenRef.current.split("|||JSON|||")[0],
-              },
-            ]);
+            const cleanText = currentAiTokenRef.current.split("|||")[0];
+            if (cleanText.trim()) {
+              setFinalTranscripts((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  text: cleanText,
+                },
+              ]);
+            }
             currentAiTokenRef.current = "";
             setCurrentAiToken("");
           }
@@ -209,7 +240,6 @@ const VoiceAgentRealtime = () => {
           break;
 
         case "assistant_transcript":
-          // Explicit message from AI (not streamed)
           setFinalTranscripts((prev) => [
             ...prev,
             { role: "assistant", text: data },
@@ -218,28 +248,61 @@ const VoiceAgentRealtime = () => {
 
         case "ai_token":
           currentAiTokenRef.current += data;
-          // Filter out the hidden JSON data from the UI
-          setCurrentAiToken(currentAiTokenRef.current.split("|||JSON|||")[0]);
+          setCurrentAiToken(currentAiTokenRef.current.split("|||")[0]);
           break;
 
         case "audio_chunk":
           queueAudioChunk(data);
-          // Do NOT clear text here. Let it accumulate until user speaks.
           break;
 
         case "structured_update":
           setExtractedData((prev) => ({ ...prev, ...data }));
           break;
 
+        case "interrupt":
+          // NEW: Stop playback immediately
+          stopAudioPlayback();
+          currentAiTokenRef.current = "";
+          setCurrentAiToken("");
+          break;
+
         case "eligibility_result":
           setEligibilityResult(data);
+          // Ensure applicationId is always set
+          const appId =
+            data.application_id || readyForVerification?.appId || null;
+          navigate("/eligibility-result", {
+            state: {
+              result: data,
+              applicationId: appId,
+              extractedData: extractedDataRef.current,
+            },
+          });
           break;
 
         case "document_verification_required":
-          // Show document upload button
-          setShowDocumentUpload(true);
-          setExtractedData(data.structured_data);
-          // Add AI message about document verification
+          // NEW: Stop mic immediately
+          stopRecording();
+
+          // NEW: Clear pending text
+          currentAiTokenRef.current = "";
+          setCurrentAiToken("");
+
+          // Manual Redirect Logic
+          if (data.application_id) {
+            setReadyForVerification({
+              appId: data.application_id,
+              message: "Please click Proceed to verify documents.",
+            });
+            toast.success(
+              "Details captured! Click 'Proceed to Verification' to continue."
+            );
+            // No auto-redirect
+          } else {
+            setShowDocumentUpload(true);
+            setExtractedData(data.structured_data);
+          }
+
           if (data.message) {
             setFinalTranscripts((prev) => [
               ...prev,
@@ -249,168 +312,204 @@ const VoiceAgentRealtime = () => {
           break;
 
         case "error":
-          setError(data);
+          toast.error(data);
           break;
 
         default:
           console.warn("Unknown message type:", type);
       }
     },
-    [queueAudioChunk, stopAudioPlayback]
+    [queueAudioChunk, stopAudioPlayback, navigate, readyForVerification?.appId]
   );
 
   /**
    * Initialize WebSocket connection to backend
    */
-  const connectWebSocket = useCallback(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.hostname}:8000/api/voice/stream`;
+  const connectWebSocket = useCallback(
+    (onOpenCallback = null) => {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const baseUrl = `${protocol}//${window.location.hostname}:8000`;
 
-    try {
-      const ws = new WebSocket(wsUrl);
+      // Attach JWT token as query param so backend can resolve user/email
+      const token = auth.getToken();
+      const query = token ? `?token=${encodeURIComponent(token)}` : "";
+      const wsUrl = `${baseUrl}/api/voice/stream${query}`;
 
-      ws.onopen = () => {
-        console.log("WebSocket connected");
-        setIsConnected(true);
-        setError(null);
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          handleWebSocketMessage(message);
-        } catch (err) {
-          console.error("Failed to parse WebSocket message:", err);
+      try {
+        if (wsRef.current) {
+          wsRef.current.close();
         }
-      };
 
-      ws.onerror = (err) => {
-        console.error("WebSocket error:", err);
-        setError("Connection error. Please check backend is running.");
-      };
+        const ws = new WebSocket(wsUrl);
 
-      ws.onclose = () => {
-        console.log("WebSocket closed");
-        setIsConnected(false);
-        setTimeout(() => {
-          if (wsRef.current === ws) {
-            connectWebSocket();
+        ws.onopen = () => {
+          console.log("WebSocket connected");
+          setIsConnected(true);
+          if (onOpenCallback) onOpenCallback();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            handleWebSocketMessage(message);
+          } catch (err) {
+            console.error("Failed to parse WebSocket message:", err);
           }
-        }, 3000); // Auto-reconnect after 3 seconds
-      };
+        };
 
-      wsRef.current = ws;
-    } catch (err) {
-      console.error("Failed to create WebSocket:", err);
-      setError("Failed to connect to voice agent");
-    }
-  }, [handleWebSocketMessage]);
+        ws.onerror = (err) => {
+          console.error("WebSocket error:", err);
+          console.error("Connection error. Please check backend is running.");
+        };
+
+        ws.onclose = () => {
+          console.log("WebSocket closed");
+          // Only update state if this is still the active socket
+          if (wsRef.current === ws) {
+            setIsConnected(false);
+          }
+        };
+
+        wsRef.current = ws;
+      } catch (err) {
+        console.error("Failed to create WebSocket:", err);
+        toast.error("Failed to connect to voice agent");
+      }
+    },
+    [handleWebSocketMessage]
+  );
 
   /**
-   * Start recording microphone audio using AudioContext for PCM16LE
+   * START RECORDING (WebM + Gain Boost)
+   * Pipeline: Mic -> AudioContext -> GainNode(5x) -> Dest -> MediaRecorder -> WebSocket
    */
   const startRecording = async () => {
     try {
+      // 1. Capture Mic
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
         },
       });
+      streamRef.current = stream;
 
-      // Create AudioContext for raw PCM audio processing
+      // 2. Setup Audio Context & Gain
       const audioContext = new (window.AudioContext ||
-        window.webkitAudioContext)({ sampleRate: 16000 });
+        window.webkitAudioContext)();
+      await audioContext.resume();
+      audioContextRef.current = audioContext;
+
       const source = audioContext.createMediaStreamSource(stream);
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 10.0; // 10x Digital Gain Boost to catch soft voices
 
-      // Create ScriptProcessor for real-time audio processing
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const destination = audioContext.createMediaStreamDestination();
 
-      processor.onaudioprocess = (e) => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          // Get float32 audio data
-          const inputData = e.inputBuffer.getChannelData(0);
+      // Connect Graph
+      source.connect(gainNode);
+      gainNode.connect(destination);
 
-          // Calculate volume for visualizer
-          let sum = 0;
-          for (let i = 0; i < inputData.length; i++) {
-            sum += inputData[i] * inputData[i];
-          }
-          const rms = Math.sqrt(sum / inputData.length);
-          setVolume(Math.min(100, rms * 400)); // Scale up for visibility
+      // 3. Setup Media Recorder on Destination Stream
+      const outputStream = destination.stream;
+      const recorder = new MediaRecorder(outputStream, {
+        mimeType: "audio/webm", // Browser Default (usually Opus)
+      });
+      mediaRecorderRef.current = recorder;
 
-          // Convert float32 (-1 to 1) to int16 PCM
-          const int16Data = new Int16Array(inputData.length);
-          for (let i = 0; i < inputData.length; i++) {
-            // Clamp and convert to 16-bit integer
-            const s = Math.max(-1, Math.min(1, inputData[i]));
-            int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-          }
-
-          // Send raw PCM16LE audio to backend
-          wsRef.current.send(int16Data.buffer);
-
-          // DEBUG: Log first send
-          if (!window.hasLoggedAudio) {
-            console.log("Sending audio data...");
-            window.hasLoggedAudio = true;
+      // 4. Data Handling (Direct Binary Send)
+      // We purposefully simplify this to reduce latency and complex processing loop
+      recorder.ondataavailable = (event) => {
+        // Trace log: confirm event firing and size
+        if (event.data.size > 0) {
+          console.log(`🎤 Audio Chunk: ${event.data.size} bytes`);
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(event.data);
+            // console.log("Sent chunk to WS");
+          } else {
+            console.warn("⚠️ WS not ready, dropping chunk");
           }
         }
       };
 
-      // Connect audio pipeline
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+      // 5. Start Recording
+      recorder.start(250); // 250ms chunks
+      console.log("✅ MediaRecorder start(250) called");
 
-      // Store references for cleanup
-      mediaRecorderRef.current = { stream, audioContext, processor, source };
       setIsRecording(true);
       isRecordingRef.current = true;
-      setError(null);
-      addLog("🎤 Recording Started");
+
+      // 6. Visualizer (Analyzer attached to Gain Output)
+      const analyzer = audioContext.createAnalyser();
+      analyzer.fftSize = 256;
+      gainNode.connect(analyzer); // Monitor the BOOSTED signal
+
+      const bufferLength = analyzer.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      const updateVolume = () => {
+        if (!isRecordingRef.current) return;
+        analyzer.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+
+        // Log Volume Occasionally
+        if (
+          Math.random() < 0.05 &&
+          wsRef.current?.readyState === WebSocket.OPEN
+        ) {
+          const rms = sum / bufferLength; // 0-255
+          wsRef.current.send(
+            JSON.stringify({
+              type: "debug_log",
+              message: `Mic Gain RMS: ${rms}`,
+            })
+          );
+        }
+
+        setVolume(sum / bufferLength);
+        requestAnimationFrame(updateVolume);
+      };
+      updateVolume();
     } catch (err) {
-      console.error("Failed to start recording:", err);
-      setError("Microphone access denied. Please allow microphone access.");
+      console.error("Error accessing microphone:", err);
+      toast.error("Could not access microphone.");
     }
   };
 
-  /**
-   * Stop recording microphone audio
-   */
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current) {
-      const { stream, audioContext, processor, source } =
-        mediaRecorderRef.current;
-
-      // Disconnect audio pipeline
-      if (source && processor) {
-        try {
-          source.disconnect();
-          processor.disconnect();
-        } catch (e) {
-          // Already disconnected
-        }
-      }
-
-      // Close audio context
-      if (audioContext) {
-        audioContext.close();
-      }
-
-      // Stop all tracks
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
-
+  const stopRecording = () => {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
+      mediaRecorderRef.current.stop();
       mediaRecorderRef.current = null;
     }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    // FIX: Send "Flush" signal to backend to force immediate processing of buffer
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "interaction_end" }));
+    }
+
+    // FIX: Do NOT close AudioContext here, as it is used for Playback too.
+    // It will be closed on component unmount (useEffect cleanup).
+    /* 
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    */
+
     setIsRecording(false);
     isRecordingRef.current = false;
     setVolume(0);
-    addLog("⏹️ Recording Stopped");
-  }, []);
+  };
 
   /**
    * Connect on mount, disconnect on unmount
@@ -428,7 +527,7 @@ const VoiceAgentRealtime = () => {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Only run once on mount
+  }, []);
 
   /**
    * Handle start/stop call button
@@ -436,8 +535,19 @@ const VoiceAgentRealtime = () => {
   const handleCallToggle = () => {
     if (isRecording) {
       stopRecording();
-    } else if (isConnected) {
-      startRecording();
+      // DO NOT close connection. Keep it alive for toggling back on.
+      // if (wsRef.current) wsRef.current.close();
+    } else {
+      // Reuse existing connection if valid
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        startRecording();
+      } else {
+        // Start fresh connection -> Then record
+        setIsConnected(false); // UI feedback
+        connectWebSocket(() => {
+          startRecording();
+        });
+      }
     }
   };
 
@@ -495,7 +605,7 @@ const VoiceAgentRealtime = () => {
         {currentAiToken && (
           <div className="flex justify-start">
             <div className="max-w-[80%] px-4 py-2 rounded-2xl rounded-bl-none bg-white text-gray-800 border border-gray-100 shadow-sm">
-              <p className="whitespace-pre-wrap text-sm">{currentAiToken}</p>
+              <Typewriter text={currentAiToken} />
             </div>
           </div>
         )}
@@ -513,14 +623,14 @@ const VoiceAgentRealtime = () => {
           <div className="mt-4 mb-4 w-full">
             <LoanResultCard
               result={{
-                eligibility_status: eligibilityResult.eligible
-                  ? "eligible"
-                  : "ineligible",
-                eligibility_score: eligibilityResult.score || 0,
-                risk_level:
-                  eligibilityResult.score > 0.7 ? "low_risk" : "medium_risk",
-                credit_tier: "Good",
-                confidence: 0.9,
+                eligibility_status:
+                  eligibilityResult.eligibility_status || "ineligible",
+                eligibility_score: eligibilityResult.eligibility_score || 0,
+                risk_level: eligibilityResult.risk_level || "medium_risk",
+                credit_tier: eligibilityResult.credit_tier || "Good",
+                confidence: eligibilityResult.confidence || 0.9,
+                debt_to_income_ratio:
+                  eligibilityResult.debt_to_income_ratio || 0,
               }}
               applicationId={eligibilityResult.application_id}
               extractedData={extractedData}
@@ -530,9 +640,19 @@ const VoiceAgentRealtime = () => {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Bottom Controls Area (Fixed) */}
       <div className="absolute bottom-0 left-0 right-0 bg-white border-t border-gray-200 p-4 pb-6 z-20">
         <div className="max-w-3xl mx-auto flex items-center gap-3">
+          {/* Manual Verification Button */}
+          {readyForVerification && (
+            <button
+              onClick={() =>
+                navigate(`/verify?applicationId=${readyForVerification.appId}`)
+              }
+              className="flex-1 bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-semibold shadow-lg animate-pulse"
+            >
+              Proceed to Verification →
+            </button>
+          )}
           {/* Text Input Bar */}
           <div className="flex-1 relative">
             <input
@@ -551,7 +671,6 @@ const VoiceAgentRealtime = () => {
                     wsRef.current.send(
                       JSON.stringify({ type: "text_input", data: text })
                     );
-                    // setFinalTranscripts(prev => [...prev, { role: 'user', text: text }]); // Removed to prevent duplication (backend echoes it)
                     e.target.value = "";
                   } else {
                     toast.error("Not connected");
@@ -604,28 +723,23 @@ const VoiceAgentRealtime = () => {
         </div>
       </div>
 
-      {/* Result Card */}
-
       {/* Document Upload Modal */}
       {showDocumentUpload && (
-        <div className="absolute inset-0 z-50 bg-white/90 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md h-auto max-h-[85%] overflow-hidden flex flex-col border border-gray-200">
-            <div className="p-4 border-b border-gray-100 flex justify-between items-center">
-              <h3 className="font-semibold text-gray-800">Verify Identity</h3>
-              <button
-                onClick={() => setShowDocumentUpload(false)}
-                className="text-gray-400 hover:text-gray-600"
-              >
-                <X size={20} />
-              </button>
-            </div>
-            <div ref={modalScrollRef} className="flex-1 p-4 overflow-y-auto">
-              <FileUpload
-                applicationId={applicationId}
-                previousUploads={uploadedFiles}
+        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="relative bg-slate-950 rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col border border-slate-800 overflow-hidden">
+            {/* Close Button (Absolute Top Right) */}
+            <button
+              onClick={() => setShowDocumentUpload(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white z-10 p-2 bg-slate-900/50 rounded-full hover:bg-slate-800 transition-colors"
+            >
+              <X size={24} />
+            </button>
+
+            <div className="flex-1 overflow-y-auto overflow-x-hidden">
+              <DocumentKYCGrid
+                uploadedFiles={uploadedFiles}
                 onUploadSuccess={(data, file) => {
-                  toast.success("Verification Complete!");
-                  // Add to list
+                  toast.success(`${file.name} Verified!`);
                   setUploadedFiles((prev) => [
                     ...prev,
                     {
@@ -633,32 +747,54 @@ const VoiceAgentRealtime = () => {
                       size: file.size,
                       type: file.type,
                       data: data,
+                      docType: file.docType, // store the docType
                     },
                   ]);
 
-                  // Force scroll to top to keep Dropzone in view
-                  if (modalScrollRef.current) {
-                    modalScrollRef.current.scrollTop = 0;
-                  }
-
-                  // Keep modal open so user can upload more files if needed
+                  // Send to backend
                   if (wsRef.current?.readyState === WebSocket.OPEN) {
                     wsRef.current.send(
-                      JSON.stringify({ type: "document_uploaded", data: data })
+                      JSON.stringify({
+                        type: "document_uploaded",
+                        data: data,
+                        docType: file.docType,
+                      })
                     );
                   }
                 }}
+                onRemove={(fileToRemove) => {
+                  setUploadedFiles((prev) =>
+                    prev.filter((f) => f.name !== fileToRemove.name)
+                  );
+                }}
               />
             </div>
-            {/* Footer for multiple uploads */}
-            <div className="p-4 border-t border-gray-100 bg-gray-50 flex flex-col items-center">
-              <p className="text-xs text-gray-500 mb-3 text-center">
-                To upload another document, remove the current one using the 'X'
-                button above.
+
+            {/* Footer */}
+            <div className="p-6 border-t border-slate-800 bg-slate-900 flex flex-col md:flex-row items-center justify-between gap-4 shrink-0">
+              <p className="text-slate-400 text-sm">
+                Ensure all documents are clear and legible before finishing.
               </p>
               <button
-                onClick={() => setShowDocumentUpload(false)}
-                className="w-full py-2 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors font-medium"
+                onClick={() => {
+                  if (uploadedFiles.length < 5) {
+                    toast.warning(
+                      "Please upload all 5 documents (Aadhaar, PAN, KYC, Bank Statement, Salary Slip) to proceed."
+                    );
+                    return;
+                  }
+                  setShowDocumentUpload(false);
+                  if (wsRef.current?.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(
+                      JSON.stringify({ type: "verification_completed" })
+                    );
+                  }
+                }}
+                className={`w-full md:w-auto px-8 py-3 rounded-xl font-semibold shadow-lg transition-all transform active:scale-95 ${
+                  uploadedFiles.length < 5
+                    ? "bg-slate-700 text-slate-400 cursor-not-allowed shadow-none"
+                    : "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20"
+                }`}
               >
                 Done / Finish Verification
               </button>

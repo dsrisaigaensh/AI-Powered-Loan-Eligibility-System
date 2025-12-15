@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { auth } from "../utils/auth";
 import { useLocation, useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import MiniChatbot from "../components/MiniChatbot";
@@ -18,6 +19,13 @@ import CallingAgentPanel from "../components/CallingAgentPanel";
 export default function ApplyPage() {
   const location = useLocation();
   const navigate = useNavigate();
+  // Require authentication before showing page
+  useEffect(() => {
+    if (!auth.isAuthenticated()) {
+      navigate("/auth");
+    }
+  }, [navigate]);
+  // ...existing code...
   const formRef = useRef(null);
   const resultRef = useRef(null);
 
@@ -56,21 +64,13 @@ export default function ApplyPage() {
           transition={{ duration: 0.6 }}
           className="bg-white border shadow-lg rounded-3xl p-8 mb-4"
         >
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between text-center md:text-left">
-            <div>
-              <h1 className="text-2xl md:text-3xl font-bold text-slate-900 mb-4 md:mb-0">
-                Apply for a Loan
-              </h1>
-              <p className="text-slate-600 max-w-3xl text-lg mb-6 md:mb-0">
-                Use the voice agent for instant eligibility, or fill out the form directly. You can get help from the AI assistant anytime.
-              </p>
-            </div>
-            <button
-              onClick={() => navigate("/")}
-              className="mt-4 md:mt-0 px-6 py-2 bg-primary-600 text-white font-semibold rounded-full shadow hover:bg-primary-700 transition"
-            >
-              Go to Home
-            </button>
+          <div className="flex flex-col items-center justify-center text-center">
+            <h1 className="text-2xl md:text-3xl font-bold text-slate-900 mb-4">
+              Apply for a Loan
+            </h1>
+            <p className="text-slate-600 max-w-3xl text-lg mb-6">
+              Use the voice agent for instant eligibility, or fill out the form directly. You can get help from the AI assistant anytime.
+            </p>
           </div>
         </motion.div>
 
@@ -108,7 +108,11 @@ export default function ApplyPage() {
                 <LoanApplicationForm
                   setEligibilityResult={setEligibilityResult}
                   setApplicationData={setApplicationData}
-                  setApplicationId={setApplicationId}
+                  setApplicationId={(id) => {
+                    setApplicationId(id);
+                    // Redirect to verification page after application submit
+                    if (id) navigate(`/verify?applicationId=${id}`);
+                  }}
                 />
               </div>
             ) : (

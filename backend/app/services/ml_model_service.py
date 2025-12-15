@@ -85,12 +85,17 @@ class MLModelService:
     def _load_models(self):
         """Load all trained models and preprocessing objects from pickle files."""
         model_dir = self._resolve_model_dir()
+        # Expose resolved model directory for diagnostics
+        self.model_dir = model_dir
 
         model_files = {
             "xgboost": "loan_xgboost_model.pkl",
             "decision_tree": "loan_decision_tree_model.pkl",
             "random_forest": "loan_random_forest_model.pkl",
         }
+        # Track per-file load errors for diagnostics
+        self.load_errors = {}
+
         for key, fname in model_files.items():
             path = model_dir / fname
             if path.exists():
@@ -100,8 +105,20 @@ class MLModelService:
                     logger.info(f"{key} model loaded from {path}")
                 except Exception as e:
                     logger.warning(f"Failed to load {key} model: {e}")
+                    # Record full exception string for diagnostics
+                    try:
+                        import traceback
+                        self.load_errors[key] = traceback.format_exc()
+                    except Exception:
+                        self.load_errors[key] = str(e)
             else:
                 logger.warning(f"Model file {fname} not found in {model_dir}")
+
+        # Expose which files exist for debugging
+        try:
+            self.available_artifacts = {p.name: p.exists() for p in model_dir.iterdir()}
+        except Exception:
+            self.available_artifacts = {}
 
         # Load feature columns
         xcols_path = model_dir / "X_columns.pkl"
@@ -165,6 +182,17 @@ class MLModelService:
             logger.warning("Label encoders not found, initializing new encoders")
             for feature in self.categorical_features:
                 self.label_encoders[feature] = LabelEncoder()
+
+    def get_status(self) -> Dict:
+        """Return diagnostic information about model loading for debugging."""
+        return {
+            "model_dir": str(getattr(self, "model_dir", "<unknown>")),
+            "available_artifacts": getattr(self, "available_artifacts", {}),
+            "loaded_models": list(self.models.keys()),
+            "x_columns_loaded": bool(self.x_columns),
+            "model_accuracies_present": bool(self.model_accuracies),
+            "load_errors": getattr(self, "load_errors", {}),
+        }
     
     def predict_eligibility(self, applicant_data: Dict) -> Dict:
         """
@@ -201,53 +229,78 @@ class MLModelService:
                 warnings.append('XGBoost model is not loaded. Prediction is not possible.')
             if not self.x_columns:
                 warnings.append('Model feature columns (X_columns) are missing. Prediction may be invalid.')
+            
+            logger.info(f"DEBUG: Models available: {list(self.models.keys())}, X_columns loaded: {self.x_columns is not None}")
 
             # Prepare features with preprocessing
             if self.x_columns and 'xgboost' in self.models:
                 features_df = self._prepare_features_v2(applicant_data)
+                logger.info(f"DEBUG: Using v2 feature preparation with {len(self.x_columns)} columns")
             else:
                 features_df = self._prepare_features(applicant_data)
-
-            # Make predictions for all models
+                logger.info(f"DEBUG: Using legacy feature preparation")
+            
+            # Make prediction (use dummy if model not loaded)
+            eligibility_score = 0.5  # Default score
+            xgb_score = 0.5  # Default score
             model_results = {}
-            for key, model in self.models.items():
-                try:
-                    if self.x_columns:
-                        X = features_df[self.x_columns]
-                        score = float(model.predict_proba(X)[0][1])
-                    else:
-                        numerical_data = features_df[self.numerical_features]
-                        if hasattr(self.scaler, 'transform'):
-                            scaled_numerical = self.scaler.transform(numerical_data)
-                        else:
-                            scaled_numerical = numerical_data.values
-                        features_processed = np.column_stack([
-                            scaled_numerical,
-                            features_df[self.categorical_features].values
-                        ])
-                        score = float(model.predict_proba(features_processed)[0][1])
-                    status = "eligible" if score >= 0.5 else "ineligible"
-                    acc = self.model_accuracies.get(key, {}).get("test", None)
-                    model_results[key] = {
-                        "eligibility_score": round(score, 3),
-                        "eligibility_status": status,
-                        "accuracy": round(acc, 3) if acc is not None else None
-                    }
-                except Exception as e:
-                    logger.warning(f"Prediction failed for model {key}: {e}")
-                    model_results[key] = {
-                        "eligibility_score": 0.0,
-                        "eligibility_status": "error",
-                        "accuracy": None,
-                        "error": str(e)
-                    }
+            
+            if self.models and 'xgboost' in self.models:
+                if self.x_columns is not None:
+                    # Use aligned DataFrame directly
+                    X = features_df[self.x_columns]
+                    
+                    # Check for NaN values and log them
+                    nan_cols = X.columns[X.isna().any()].tolist()
+                    if nan_cols:
+                        logger.warning(f"DEBUG: NaN columns detected: {nan_cols}")
+                        X = X.fillna(0)  # Fill NaN with 0
+                    
+                    # DIAGNOSTIC: Log the feature vector
+                    row_dict = X.iloc[0].to_dict()
+                    logger.info(f"ML PREDICTION INPUT: Income={row_dict.get('Monthly_Income')}, Score={row_dict.get('Credit_Score')}, Amount={row_dict.get('Loan_Amount_Requested')}, DTI={row_dict.get('Debt_to_Income_Ratio')}")
+                    logger.info(f"DEBUG: Full feature dict: {row_dict}")
 
-            # Use XGBoost for risk, recommendations, etc.
-            xgb_score = model_results.get("xgboost", {}).get("eligibility_score", 0)
-            eligibility_status = model_results.get("xgboost", {}).get("eligibility_status", "ineligible")
-            risk_level = self._assess_risk_level(applicant_data, xgb_score)
-            recommendations = self._generate_recommendations(applicant_data, xgb_score)
+                    pred_proba = self.models['xgboost'].predict_proba(X)
+                    eligibility_score = float(pred_proba[0][1])
+                    # Cap at 95% for realistic scoring (no perfect 100% scores)
+                    eligibility_score = min(eligibility_score, 0.95)
+                    logger.info(f"DEBUG: Raw model output: {pred_proba}, Eligibility score: {eligibility_score}")
+                    xgb_score = eligibility_score
+                    model_results = {'xgboost': eligibility_score}
+                else:
+                    # Legacy path: scale numerics and concat encoded categoricals
+                    numerical_data = features_df[self.numerical_features]
+                    if hasattr(self.scaler, 'transform'):
+                        scaled_numerical = self.scaler.transform(numerical_data)
+                    else:
+                        scaled_numerical = numerical_data.values
+                    features_processed = np.column_stack([
+                        scaled_numerical,
+                        features_df[self.categorical_features].values
+                    ])
+                    eligibility_score = float(self.models['xgboost'].predict_proba(features_processed)[0][1])
+                    # Cap at 95% for realistic scoring
+                    eligibility_score = min(eligibility_score, 0.95)
+                    xgb_score = eligibility_score
+                    model_results = {'xgboost': eligibility_score}
+            else:
+                # Dummy prediction logic for testing when no model is available
+                eligibility_score = self._dummy_predict(applicant_data)
+                xgb_score = eligibility_score
+                model_results = {'dummy': eligibility_score}
+                logger.warning("Using dummy prediction - no trained model available")
+            
+            # Determine eligibility status and risk level
+            eligibility_status = "eligible" if eligibility_score >= 0.5 else "ineligible"
+            risk_level = self._assess_risk_level(applicant_data, eligibility_score)
+            
+            # Generate recommendations
+            recommendations = self._generate_recommendations(applicant_data, eligibility_score)
+            
             result = {
+                "eligibility_score": eligibility_score,
+                "eligibility_status": eligibility_status,
                 "models": model_results,
                 "risk_level": risk_level,
                 "recommendations": recommendations,
@@ -257,6 +310,7 @@ class MLModelService:
                 "warnings": warnings
             }
             logger.info(f"Loan prediction generated: {model_results}")
+            logger.info(f"DEBUG: eligibility_score={eligibility_score}, eligibility_status={eligibility_status}")
             if warnings:
                 logger.warning(f"Loan prediction warnings: {warnings}")
             return result
@@ -446,6 +500,7 @@ class MLModelService:
         Dummy prediction logic when model is not loaded
         Used for testing purposes with the 23-feature format
         """
+        logger.error(f"!!! DUMMY PRED START - Input: {applicant_data} !!!")
         score = 0.0
         
         # Credit score (normalized 300-850)
@@ -476,7 +531,9 @@ class MLModelService:
         account_age = applicant_data.get('Account_Age_Months', 12)
         score += min(account_age / 60, 0.1)  # Max 0.1 for accounts older than 5 years
         
-        return min(max(score, 0.0), 1.0)
+        final_score = min(max(score, 0.0), 1.0)
+        logger.error(f"!!! DUMMY PRED END - Score: {final_score} !!!")
+        return final_score
     
     def _assess_risk_level(self, applicant_data: Dict, eligibility_score: float) -> str:
         """Assess risk level based on applicant data"""

@@ -66,7 +66,6 @@ function Login() {
         </p>
 
         <form onSubmit={handleLogin} className="space-y-4">
-
           {/* Email Field */}
           <div>
             <label className="text-slate-300 text-sm">Email</label>

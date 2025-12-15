@@ -13,6 +13,7 @@ import {
   Shield,
   User,
 } from "lucide-react";
+import UserNotifications from "./UserNotifications";
 
 /*
   Redesigned NAVBAR
@@ -91,10 +92,34 @@ export default function Navbar() {
               AI Loan System
             </span>
           </Link>
+
+          {/* Desktop Navigation */}
+          <nav className="hidden md:flex items-center gap-6 ml-6">
+            {routes
+              .filter((r) => r.show)
+              .map((item) => (
+                <Link
+                  key={item.href}
+                  to={item.href}
+                  className={`text-sm font-medium transition-colors ${
+                    isActive(item.href)
+                      ? "text-indigo-600"
+                      : "text-gray-600 hover:text-indigo-600"
+                  }`}
+                >
+                  {item.label}
+                </Link>
+              ))}
+          </nav>
         </div>
 
         {/* Right section */}
         <div className="flex items-center gap-4">
+          {/* User Notifications */}
+          {isAuthenticated && !isManager && user?.id && (
+            <UserNotifications userId={user.id} />
+          )}
+
           {/* User Dropdown */}
           {isAuthenticated ? (
             <div className="relative">
@@ -117,8 +142,12 @@ export default function Navbar() {
                     <div className="mb-3 flex items-center gap-2">
                       <User className="w-8 h-8 text-indigo-700" />
                       <div>
-                        <div className="font-semibold text-gray-900">{user?.full_name || user?.name || "User"}</div>
-                        <div className="text-xs text-gray-500">{user?.email || "No email"}</div>
+                        <div className="font-semibold text-gray-900">
+                          {user?.full_name || user?.name || "User"}
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {user?.email || "No email"}
+                        </div>
                       </div>
                     </div>
                     <Link
@@ -190,10 +219,12 @@ export default function Navbar() {
                       key={item.href}
                       to={item.href}
                       onClick={() => setIsSidebarOpen(false)}
-                      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition ${{
-                        true: "bg-indigo-50 text-indigo-700",
-                        false: "hover:bg-gray-100",
-                      }[isActive(item.href)]}`}
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition ${
+                        {
+                          true: "bg-indigo-50 text-indigo-700",
+                          false: "hover:bg-gray-100",
+                        }[isActive(item.href)]
+                      }`}
                     >
                       <item.icon className="w-4 h-4" />
                       {item.label}
